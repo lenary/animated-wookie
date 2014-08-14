@@ -32,8 +32,9 @@
 -module(vclock).
 
 -export([fresh/0,descends/2,merge/1,get_counter/2, subtract_dots/2,
-         increment/2,all_nodes/1, equal/2,
-         to_binary/1, from_binary/1, dominates/2, glb/2]).
+         increment/2,all_nodes/1, equal/2,immediately_succeeds/2,
+         to_binary/1, from_binary/1, dominates/2, glb/2,
+         lt/2, lte/2]).
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
@@ -54,6 +55,16 @@
 -spec fresh() -> vclock().
 fresh() ->
     [].
+
+%% @doc A lte B means that A happened before B
+-spec lte(Va :: vclock(), Vb :: vclock()) -> boolean().
+lte(Va,Vb) ->
+    descends(Vb,Va).
+
+%% @doc A lt B means that everything in A happend before everything in B
+lt(Va,Vb) ->
+    dominates(Vb,Va).
+    
 
 % @doc Return true if Va is a direct descendant of Vb, else false -- remember, a vclock is its own descendant!
 -spec descends(Va :: vclock()|[], Vb :: vclock()|[]) -> boolean().
@@ -142,6 +153,24 @@ increment(Node, VClock) ->
                             end,
     [{Node,Ctr}|NewV].
 
+%% A immediately_succeeds B if and only if: A has exactly 1 event that B doesn't have
+-spec immediately_succeeds(vclock(), vclock()) -> boolean().
+immediately_succeeds([], _) ->
+    false; %% fresh vclock doesn't have any events, so can't have more than B
+immediately_succeeds([{Node,CountA}|VClockA], VClockB) ->
+    CountB = case lists:keyfind(Node, 1, VClockB) of
+                 false ->        0;
+                 {Node,Count} -> Count
+             end,
+    if (CountB + 1) > CountA  -> false; %% B+1 is bigger than A, nope
+       (CountB + 1) == CountA -> lists:all(fun({NodeX,CountX}) -> %% A = B+1, so check the rest of A
+                                                 case lists:keyfind(NodeX, 1, VClockB) of
+                                                     {NodeX, CountY} -> CountX == CountY; %% B == A, that's fine
+                                                     false           -> false             %% B =/= A, 2 events must have happened in between
+                                                 end
+                                           end, VClockA);
+       true -> immediately_succeeds(VClockA, VClockB)
+    end.
 
 % @doc Return the list of all nodes that have ever incremented VClock.
 -spec all_nodes(VClock :: vclock()) -> [vclock_node()].

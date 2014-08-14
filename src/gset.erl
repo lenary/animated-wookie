@@ -1,17 +1,23 @@
 -module(gset).
 
--behaviour(op_crdt).
+-behaviour(po_crdt).
 
--export([new/2, prepare/3, effect/3, eval/2]).
+-export([new/1,
+         effect/4,
+         eval/2,
+         test/0
+        ]).
 
-new(_Arg, _Actor) ->
+new(_Actor) ->
     ordsets:new().
 
-prepare({add, E}, _Actor, _Set) ->
-    {add, E}.
-
-effect({add, E}, _Actor, Set) ->
-    ordsets:add_element(E, Set).
+effect({add, E}, Ts, _Actor, Set) ->
+    ordsets:add_element({Ts, E}, Set).
 
 eval(rd, Set) ->
-    ordsets:to_list(Set).
+    [ E || {_,E} <- ordsets:to_list(Set)].
+
+test() ->
+    {ok,_} = po_log_node:start(a,?MODULE),
+    po_log_node:update(a,{add,a}),
+    [a] = po_log_node:eval(a,rd).

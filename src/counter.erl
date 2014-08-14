@@ -1,22 +1,29 @@
 -module(counter).
 
--behaviour(op_crdt).
+-behaviour(po_crdt).
 
--export([new/2, prepare/3, effect/3, eval/2]).
+-export([new/1,
+         effect/4,
+         eval/2,
+         test/0
+        ]).
 
-new(_Arg, _Actor) ->
-    0.
+%% Unbelievable inefficient implementation
+%% but straight out the paper and simple.
+new(_Actor) ->
+    ordsets:new().
 
-prepare(increment, _Actor, _N) ->
-    increment;
-prepare(decrement, _Actor, _N) ->
-    decrement.
+effect(increment, Ts, _Actor, Set) ->
+    ordsets:add_element({Ts, increment}, Set);
+effect(decrement, Ts, _Actor, Set) ->
+    ordsets:add_element({Ts,decrement}, Set).
 
-effect(increment, _Actor, N) ->
-    N + 1;
-effect(decrement, _Actor, N) ->
-    N - 1.
+eval(rd, Set) ->
+    Inc = length([1  || {_,increment} <- Set]),
+    Dec = length([-1 || {_,decrement} <- Set]),
+    Inc - Dec.
 
-eval(rd, N) ->
-    N.
-
+test() ->
+    {ok,_} = po_log_node:start(a, ?MODULE),
+    po_log_node:update(a,increment),
+    1 = po_log_node:eval(a,rd).

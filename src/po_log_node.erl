@@ -1,15 +1,17 @@
 -module(po_log_node).
 -behaviour(gen_server).
 
--compile([{parse_transform, lager_transform}]).
-
 %% ------------------------------------------------------------------
 %% API Function Exports
 %% ------------------------------------------------------------------
 
 -export([start/2,
+         add_peer/2,
+         rem_peer/2,
          eval/2,
-         update/3]).
+         update/2,
+         effect/4
+        ]).
 
 %% ------------------------------------------------------------------
 %% gen_server Function Exports
@@ -22,63 +24,92 @@
 %% API Function Definitions
 %% ------------------------------------------------------------------
 
-start(Type, Arg) ->
-    gen_server:start_link(?MODULE, [Type, Arg], []).
+start(Name, Type) ->
+    gen_server:start({local, Name}, ?MODULE, [Type, Name], []).
 
+add_peer(Node, Peer) ->
+    ok = gen_server:call(Node, {add_peer, Peer}),
+    ok = gen_server:call(Peer, {add_peer, Node}).
+
+rem_peer(Node, Peer) ->
+    ok = gen_server:call(Node, {rem_peer, Peer}).
+    
 eval(Node, Operation) ->
     gen_server:call(Node, {eval, Operation}).
 
-update(Node, Operation, OtherNodes) ->
-    gen_server:call(Node, {update, Operation, OtherNodes}).
+update(Node, Operation) ->
+    gen_server:call(Node, {update, Operation}).
 
-effect(Node, PreparedOp) ->
-    %% FIXME: something about transportation, somehow
-    gen_server:cast(Node, {effect, PreparedOp}).
+effect(Node, Operation, Ts, Origin) ->
+    gen_server:call(Node, {effect, Operation, Ts, Origin}).
+
 
 %% ------------------------------------------------------------------
 %% gen_server Function Definitions
 %% ------------------------------------------------------------------
 
 -record(po_log_node, {
+          name :: atom(),
           mod :: module(),
-          dt :: term()
+          dt :: term(),
+          trcb :: term()
          }).
 
-init([Mod, Arg]) ->
-    DT = Mod:new(Arg, self()),
-    lager:info("[~p:~s] new(~p, self()) = ~p", [self(), Mod, Arg, DT]),
-    {ok, #po_log_node{mod=Mod, dt=DT}}.
+init([Mod,Name]) ->
+    TRCB = trcb:init(Name),
+    
+    %% To do retransmission
+    timer:send_interval(10, retry),
+    
+    DT = Mod:new(Name),
+    lager:info("[~p:~s] new(self()) = ~p", [Name, Mod, DT]),
+
+    {ok, #po_log_node{name=Name, mod=Mod, dt=DT, trcb=TRCB}}.
+
+
+handle_call({add_peer, NewPeer}, _From, State=#po_log_node{trcb=TRCB}) ->
+    {ok, TRCB1} = trcb:add_peer(NewPeer, TRCB),
+    {reply, ok, State#po_log_node{trcb=TRCB1}};
+
+handle_call({rem_peer, OldPeer}, _From, State=#po_log_node{trcb=TRCB}) ->
+    {ok, TRCB1} = trcb:rem_peer(OldPeer, TRCB),
+    {reply, ok, State#po_log_node{trcb=TRCB1}};
 
 handle_call({eval, Operation}, _From, State = #po_log_node{mod=Mod,dt=DT}) ->
     %% A Read
     Res = Mod:eval(Operation, DT),
-    lager:info("[~p:~s] eval(~p, ~p) = ~p", [self(), Mod, Operation, DT, Res]),
-
+    lager:info("[~p:~s] eval(~p, ~p) = ~p", [State#po_log_node.name, Mod, Operation, DT, Res]),
     {reply, Res, State};
-handle_call({update, Operation, OtherNodes}, _From, State = #po_log_node{mod=Mod,dt=DT}) ->
-    %% Make Prepared Op
-    POp = Mod:prepare(Operation, self(), DT),
-    lager:info("[~p:~s] prepare(~p, self(), ~p) = ~p", [self(), Mod, Operation, DT, POp]),
 
-    %% Send to remote for effect
-    [effect(OtherNode, POp) || OtherNode <- OtherNodes, OtherNode /= self() ],
+handle_call({update, Operation}, _From, State = #po_log_node{mod=Mod,dt=DT}) ->
+    TRCB = State#po_log_node.trcb,
+    {ok, Ts, TRCB1} = trcb:cast(Operation, TRCB),
 
-    %% Local effect
-    DT1 = Mod:effect(POp, self(), DT),
-    lager:info("[~p:~s] effect(~p, self(), ~p) = ~p", [self(), Mod, POp, DT, DT1]),
+    %% Local Effect
+    DT1 = apply_effect(State#po_log_node.name,Mod,Operation,Ts,DT),
 
-    {reply, ok, State#po_log_node{dt=DT1}};
+    {reply, ok, State#po_log_node{dt=DT1,trcb=TRCB1}};
+
+handle_call({effect, Operation, Ts, Origin}, _From, State=#po_log_node{mod=Mod,dt=DT,trcb=TRCB}) ->
+    %% TRCB Chooses what messages to deliver upon recieving this new message
+    {ok, Effects, TRCB1} = trcb:deliver(Operation, Ts, Origin, TRCB),
+
+    %% Local Effects
+    DT1 = apply_effects(State#po_log_node.name, Mod, Effects, DT),
+    
+    {reply, ok, State#po_log_node{dt=DT1,trcb=TRCB1}};
+
 handle_call(_Request, _From, State) ->
     {reply, ok, State}.
 
-handle_cast({effect, PreparedOp}, State = #po_log_node{mod=Mod,dt=DT}) ->
-    %% Local Effect of Remotely Prepared Op
-    DT1 = Mod:effect(PreparedOp, self(), DT),
-    lager:info("[~p:~s] effect(~p, self(), ~p) = ~p", [self(), Mod, PreparedOp, DT, DT1]),
 
-    {noreply, State#po_log_node{dt=DT1}};
 handle_cast(_Msg, State) ->
     {noreply, State}.
+
+handle_info(retry, State = #po_log_node{trcb=TCRB}) ->
+    %% Retry Outstanding Messages (remember: lossy network)
+    {ok, TRCB1} = trcb:retry_outgoing(TCRB),
+    {noreply, State#po_log_node{trcb=TRCB1}};
 
 handle_info(_Info, State) ->
     {noreply, State}.
@@ -93,3 +124,13 @@ code_change(_OldVsn, State, _Extra) ->
 %% Internal Function Definitions
 %% ------------------------------------------------------------------
 
+apply_effects(_Name, _Mod, [], DT) ->
+    DT;
+apply_effects(Name, Mod, [{Operation,Ts}|Rest], DT) ->
+    DT1 = apply_effect(Name, Mod,Operation,Ts,DT),
+    apply_effects(Name, Mod, Rest, DT1).
+
+apply_effect(Name, Mod, Operation, Ts, DT) ->
+    DT1 = Mod:effect(Operation, Ts, Name, DT),
+    lager:info("[~p:~s] effect(~p, ~p, self(), ~p) = ~p", [Name, Mod, Operation, Ts, DT, DT1]),
+    DT1.
