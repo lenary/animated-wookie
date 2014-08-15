@@ -158,18 +158,13 @@ increment(Node, VClock) ->
 immediately_succeeds([], _) ->
     false; %% fresh vclock doesn't have any events, so can't have more than B
 immediately_succeeds([{Node,CountA}|VClockA], VClockB) ->
-    CountB = case lists:keyfind(Node, 1, VClockB) of
-                 false ->        0;
-                 {Node,Count} -> Count
-             end,
+    CountB = get_counter(Node, VClockB),
     if (CountB + 1) > CountA  -> false; %% B+1 is bigger than A, nope
        (CountB + 1) == CountA -> lists:all(fun({NodeX,CountX}) -> %% A = B+1, so check the rest of A
-                                                 case lists:keyfind(NodeX, 1, VClockB) of
-                                                     {NodeX, CountY} -> CountX == CountY; %% B == A, that's fine
-                                                     false           -> false             %% B =/= A, 2 events must have happened in between
-                                                 end
+                                                   CountY = get_counter(NodeX, VClockB),
+                                                   CountY >= CountX
                                            end, VClockA);
-       true -> immediately_succeeds(VClockA, VClockB)
+       true                   -> immediately_succeeds(VClockA, VClockB)
     end.
 
 % @doc Return the list of all nodes that have ever incremented VClock.

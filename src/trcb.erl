@@ -28,13 +28,14 @@
          rem_peer/2,
          cast/2,
          deliver/4,
-         retry_outgoing/1,
+         retry_cast/1,
+         retry_deliver/1,
          stable/1
         ]).
 
 %% Some networks lose messages, we'll assume that they get lost this proportion
 %% of the time, but 
--define(NETWORK_LOSSINESS, 0.9).
+-define(NETWORK_LOSSINESS, 0.0).
 
 -record(trcb, {
           current     :: actor(),
@@ -99,37 +100,53 @@ cast(Message, State=#trcb{current=Self,
     
     %% 3. Attempt some sends
     Outgoing2 = attempt_sends(Outgoing1, State#trcb{peer_clocks=Clocks1}),
-    Outgoing3 = prune_outgoing(Outgoing2),
-    lager:info("[~p:?] outgoing: ~p -> ~p", [self(), Outgoing1, Outgoing3]),
+    lager:info("[~p:?:?] outgoing: ~p -> ~p", [self(), Outgoing1, Outgoing2]),
     
-    {ok, Clock1, State#trcb{peer_clocks=Clocks1,outgoing_q=Outgoing3}}.
+    {ok, Clock1, State#trcb{peer_clocks=Clocks1,outgoing_q=Outgoing2}}.
 
 %% Called at interval by the server to send any outstanding messages.
--spec retry_outgoing(state()) -> {ok, state()}.
-retry_outgoing(State = #trcb{outgoing_q=[]}) ->
+-spec retry_cast(state()) -> {ok, state()}.
+retry_cast(State = #trcb{outgoing_q=[]}) ->
     {ok, State};
-retry_outgoing(State = #trcb{outgoing_q=Outgoing}) ->
+retry_cast(State = #trcb{outgoing_q=Outgoing}) ->
     Outgoing1 = attempt_sends(Outgoing, State),
-    Outgoing2 = prune_outgoing(Outgoing1),
-    lager:info("[~p:?] outgoing: ~p -> ~p", [self(), Outgoing, Outgoing2]),
+    lager:info("[~p:?:?] outgoing: ~p -> ~p", [self(), Outgoing, Outgoing1]),
     
-    {ok, State#trcb{outgoing_q=Outgoing2}}.
+    {ok, State#trcb{outgoing_q=Outgoing1}}.
 
 
 -spec deliver(message(), timestamp(), actor(), state()) ->
                      {ok, [{message(),timestamp()}], state()}.
 deliver(Message, Clock, Origin, State=#trcb{incoming_q=Incoming}) ->
-    %% FIXME
+    %% 1. Add to the Incoming Queue
     Incoming1 = [{Message, Clock, Origin} | Incoming],
     State1 = State#trcb{incoming_q = Incoming1},
     
-    %% wat
+    %% 2. Check the Incoming Queue for ready messages
     {ok, Ready, State2} = find_ready(State1),
-    lager:info("[~p:?] incoming: ~p -> ~p", [self(), Incoming1, State2#trcb.incoming_q]),
-    lager:info("[~p:?] peer_clocks: ~p -> ~p", [self(), State1#trcb.peer_clocks, State2#trcb.peer_clocks]),
+    lager:info("[~p:?:?] incoming: ~p -> ~p {~p}", [self(), Incoming1, State2#trcb.incoming_q, State#trcb.peer_clocks]),
 
+    %% 3. Update the current peer's timestamp with delivered message timestamps
+    State3 = merge_ts([Ts || {_,Ts,_} <- Ready], State2),
+
+    %% 4. Deliver messages
+    {ok, as_messages(Ready), State3}.
+
+
+-spec retry_deliver(state()) -> {ok, [{message(), timestamp()}], state()}.
+retry_deliver(State=#trcb{incoming_q=[]}) ->
+    {ok, [], State};
+retry_deliver(State) ->
+    %% 1. Check the Incoming Queue for ready messages
+    {ok, Ready, State1} = find_ready(State),
+    lager:info("[~p:?:?] incoming: ~p -> ~p {~p}", [self(), State#trcb.incoming_q, State1#trcb.incoming_q, State#trcb.peer_clocks]),
+
+    %% 2. Update the current peer's timesamp with delivered mesage timestamps
+    State2 = merge_ts([Ts || {_,Ts,_} <- Ready], State1),
+
+    %% 3. Deliver messages
     {ok, as_messages(Ready), State2}.
-
+    
 
 %% In this version we don't actually care about stability
 -spec stable(state()) -> {stable, timestamp(), state()} | unstable.
@@ -153,28 +170,29 @@ as_messages(Incoming) ->
 %% and delivers a subset of the outgoing queue. It won't deliver to any peer
 %% in #trcb.muted.
 -spec attempt_sends(outgoing_q(), state()) -> outgoing_q().
-attempt_sends([], _State) ->
-    [];
-attempt_sends([{_Message, _Clock, []}|Rest], State) ->
-    attempt_sends(Rest, State);
-attempt_sends([{Message, Clock, Peers}|Rest], State) ->
-    [attempt_peer_sends(Message, Clock, Peers, State)|attempt_sends(Rest,State)].
+attempt_sends(Outgoing, State) ->
+    [attempt_peer_sends(Message, Clock, Peers, State)
+     || {Message, Clock, Peers} <- Outgoing,
+        Peers /= []
+    ].
+
 
 -spec attempt_peer_sends(message(), timestamp(), [actor()],state()) ->
                                 {message(), timestamp(), [actor()]}.
 attempt_peer_sends(Message, Clock, Peers, State) ->
-    LeftPeers = lists:filter(fun(Peer) ->
-                                     %% If it's muted, don't attempt a send,
-                                     %% and include in leftover peers
-                                     ordsets:is_element(Peer, State#trcb.muted) orelse
-                                         %% If send fails, include in leftover peers
-                                         not attempt_peer_send(State#trcb.current,
-                                                               Message,
-                                                               Clock,
-                                                               Peer)
-                             end, Peers),
+    {MutedPeers,ReadyPeers} = lists:partition(fun(Peer) ->
+                                                      Peer == State#trcb.current orelse
+                                                          ordsets:is_element(Peer, State#trcb.muted)
+                                              end, Peers),
 
-    {Message, Clock, LeftPeers}.
+    {_SuccessPeers,FailPeers} = lists:partition(fun(Peer) ->
+                                                       attempt_peer_send(State#trcb.current,
+                                                                         Message,
+                                                                         Clock,
+                                                                         Peer)
+                                               end, ReadyPeers),
+    
+    {Message, Clock, MutedPeers ++ FailPeers}.
 
 
 %% Does the send, which fails at a proportion of ?NETWORK_LOSINESS
@@ -187,29 +205,28 @@ attempt_peer_send(Origin, Message, Clock, Peer) ->
                true
     end.
 
-%% Removes any entries in the outgoing_q that don't have any peers left to send to
--spec prune_outgoing(outgoing_q()) -> outgoing_q().
-prune_outgoing([]) -> [];
-prune_outgoing([{_Message, _Ts, []} | Rest]) -> 
-    prune_outgoing(Rest);
-prune_outgoing([Entry | Rest]) -> 
-    [Entry | prune_outgoing(Rest)].
-
 
 %% Finds any messages from the incoming queue that can be delivered, and delivers them
 -spec find_ready(state()) -> {ok, [incoming_entry()], state()}.
+find_ready(State=#trcb{incoming_q=[]}) ->
+    {ok, [], State};
 find_ready(State=#trcb{incoming_q=Incoming, muted=Muted, peer_clocks=PeerClocks}) ->
     {NotReady, MaybeReady} = lists:partition(fun({_Message,_Ts,Origin}) ->
                                                 ordsets:is_element(Origin,Muted)
                                               end, Incoming),
 
-    MaybeReady1 = sort_by_ts(MaybeReady),
-    
-    {Ready, NotReady1, PeerClocks1} = find_ready(MaybeReady1, {[], NotReady, PeerClocks}),
+    CurrentTs = orddict:fetch(State#trcb.current, PeerClocks),
+
+    %% find_ready may be incorrect, but I'm not sure.
+    {Ready, NotReady1, PeerClocks1, _} = find_ready(MaybeReady, {[], NotReady, PeerClocks, CurrentTs}),
 
     %% I really fucking hope this puts the ones with the smallest vclocks first
     %% as we apply in this order. Sigh.
     Ready1 = sort_by_ts(Ready),
+    case Ready of
+        [] -> ok;
+        [_|_] -> lager:info("sort_by_ts(~p) -> ~p", [Ready, Ready1])
+    end,
 
     {ok, Ready1, State#trcb{incoming_q=NotReady1, peer_clocks=PeerClocks1}}.
 
@@ -220,13 +237,13 @@ find_ready(State=#trcb{incoming_q=Incoming, muted=Muted, peer_clocks=PeerClocks}
 %% added to ready. If not, then PeerClocks isn't updated and 
 find_ready([], FoldState) ->
     FoldState;
-find_ready([{_Message,Ts,Origin} = Entry | Rest], {Ready, NotReady, PeerClocks}) ->
+find_ready([{_Message,Ts,Origin} = Entry | Rest], {Ready, NotReady, PeerClocks, CurrentTs}) ->
     %% Append to Ready, doesn't matter where you put it on NotReady
     OriginTs = orddict:fetch(Origin, PeerClocks),
-    case vclock:immediately_succeeds(Ts,OriginTs) of
+    case vclock:immediately_succeeds(Ts,vclock:merge([CurrentTs,OriginTs])) of
         true ->  PeerClocks1 = orddict:store(Origin, vclock:merge([Ts,OriginTs]), PeerClocks),
-                 find_ready(Rest, {Ready ++ [Entry], NotReady,           PeerClocks1});
-        false -> find_ready(Rest, {Ready,            [Entry | NotReady], PeerClocks})
+                 find_ready(Rest, {Ready ++ [Entry], NotReady,           PeerClocks1, CurrentTs});
+        false -> find_ready(Rest, {Ready,            [Entry | NotReady], PeerClocks,  CurrentTs})
     end.
 
 %% This may completely break - vclock:descends I doubt is total
@@ -235,3 +252,12 @@ sort_by_ts(MaybeReady) ->
     lists:sort(fun({_,TsA,_}, {_,TsB,_}) ->
                        vclock:lte(TsA,TsB)
                end, MaybeReady).
+
+-spec merge_ts([timestamp()], state()) -> state().
+merge_ts(Tss, State=#trcb{current=Self,peer_clocks=PeerClocks}) ->
+    PeerClocks1 = orddict:update(Self,
+                                 fun(Clock) ->
+                                         vclock:merge([Clock|Tss])
+                                 end,
+                                 PeerClocks),
+    State#trcb{peer_clocks=PeerClocks1}.

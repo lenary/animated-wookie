@@ -50,20 +50,21 @@ start(Name, Type) ->
     gen_server:start({local, Name}, ?MODULE, [Type, Name], []).
 
 add_peer(Node, Peer) ->
-    ok = gen_server:call(Node, {add_peer, Peer}),
-    ok = gen_server:call(Peer, {add_peer, Node}).
+    ok = gen_server:call(Node, {add_peer, Peer}, infinity),
+    ok = gen_server:call(Peer, {add_peer, Node}, infinity).
 
 rem_peer(Node, Peer) ->
-    ok = gen_server:call(Node, {rem_peer, Peer}).
+    ok = gen_server:call(Node, {rem_peer, Peer}, infinity),
+    ok = gen_server:call(Peer, {rem_peer, Node}, infinity).
     
 eval(Node, Operation) ->
-    gen_server:call(Node, {eval, Operation}).
+    gen_server:call(Node, {eval, Operation}, infinity).
 
 update(Node, Operation) ->
-    gen_server:call(Node, {update, Operation}).
+    gen_server:call(Node, {update, Operation}, infinity).
 
 effect(Node, Operation, Ts, Origin) ->
-    gen_server:call(Node, {effect, Operation, Ts, Origin}).
+    gen_server:cast(Node, {effect, Operation, Ts, Origin}).
 
 
 %% ------------------------------------------------------------------
@@ -81,10 +82,11 @@ init([Mod,Name]) ->
     TRCB = trcb:init(Name),
     
     %% To do retransmission
-    timer:send_interval(10, retry),
+    timer:send_interval(100, retry_outgoing),
+    timer:send_interval(100, retry_incoming),
     
     DT = Mod:new(Name),
-    lager:info("[~p:~s] new(self()) = ~p", [Name, Mod, DT]),
+    lager:info("[~p:~p:~s] new(self()) = ~p", [self(), Name, Mod, DT]),
 
     {ok, #po_log_node{name=Name, mod=Mod, dt=DT, trcb=TRCB}}.
 
@@ -100,7 +102,7 @@ handle_call({rem_peer, OldPeer}, _From, State=#po_log_node{trcb=TRCB}) ->
 handle_call({eval, Operation}, _From, State = #po_log_node{mod=Mod,dt=DT}) ->
     %% A Read
     Res = Mod:eval(Operation, DT),
-    lager:info("[~p:~s] eval(~p, ~p) = ~p", [State#po_log_node.name, Mod, Operation, DT, Res]),
+    lager:info("[~p:~p:~s] eval(~p, ~p) = ~p", [self(),State#po_log_node.name, Mod, Operation, DT, Res]),
     {reply, Res, State};
 
 handle_call({update, Operation}, _From, State = #po_log_node{mod=Mod,dt=DT}) ->
@@ -112,26 +114,42 @@ handle_call({update, Operation}, _From, State = #po_log_node{mod=Mod,dt=DT}) ->
 
     {reply, ok, State#po_log_node{dt=DT1,trcb=TRCB1}};
 
-handle_call({effect, Operation, Ts, Origin}, _From, State=#po_log_node{mod=Mod,dt=DT,trcb=TRCB}) ->
-    %% TRCB Chooses what messages to deliver upon recieving this new message
-    {ok, Effects, TRCB1} = trcb:deliver(Operation, Ts, Origin, TRCB),
-
-    %% Local Effects
-    DT1 = apply_effects(State#po_log_node.name, Mod, Effects, DT),
-    
-    {reply, ok, State#po_log_node{dt=DT1,trcb=TRCB1}};
-
 handle_call(_Request, _From, State) ->
     {reply, ok, State}.
 
 
+handle_cast({effect, Operation, Ts, Origin}, State=#po_log_node{mod=Mod,dt=DT,trcb=TRCB}) ->
+    %% TRCB Chooses what messages to deliver upon recieving this new message
+    {ok, Effects, TRCB1} = trcb:deliver(Operation, Ts, Origin, TRCB),
+    case Effects of
+        [] -> ok;
+        [_|_] -> lager:info("[~p:~p:~s] effects delivered by ts ~p -> ~p", [self(), State#po_log_node.name, Mod, Ts, Effects])
+    end,
+
+    %% Local Effects
+    DT1 = apply_effects(State#po_log_node.name, Mod, Effects, DT),
+    
+    {noreply, State#po_log_node{dt=DT1,trcb=TRCB1}};
+
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
-handle_info(retry, State = #po_log_node{trcb=TCRB}) ->
+
+handle_info(retry_outgoing, State = #po_log_node{trcb=TCRB}) ->
     %% Retry Outstanding Messages (remember: lossy network)
-    {ok, TRCB1} = trcb:retry_outgoing(TCRB),
+    {ok, TRCB1} = trcb:retry_cast(TCRB),
     {noreply, State#po_log_node{trcb=TRCB1}};
+
+handle_info(retry_incoming, State= #po_log_node{mod=Mod,dt=DT,trcb=TRCB}) ->
+    {ok, Effects, TRCB1} = trcb:retry_deliver(TRCB),
+    case Effects of
+        [] -> ok;
+        [_|_] -> lager:info("[~p:~p:~s] effects delivered -> ~p", [self(), State#po_log_node.name, Mod, Effects])
+    end,
+
+    %% Local Effects
+    DT1 = apply_effects(State#po_log_node.name, Mod, Effects, DT),
+    {noreply, State#po_log_node{trcb=TRCB1, dt=DT1}};
 
 handle_info(_Info, State) ->
     {noreply, State}.
@@ -154,5 +172,5 @@ apply_effects(Name, Mod, [{Operation,Ts}|Rest], DT) ->
 
 apply_effect(Name, Mod, Operation, Ts, DT) ->
     DT1 = Mod:effect(Operation, Ts, Name, DT),
-    lager:info("[~p:~s] effect(~p, ~p, self(), ~p) = ~p", [Name, Mod, Operation, Ts, DT, DT1]),
+    lager:info("[~p:~p:~s] effect(~p, ~p, self(), ~p) = ~p", [self(), Name, Mod, Operation, Ts, DT, DT1]),
     DT1.

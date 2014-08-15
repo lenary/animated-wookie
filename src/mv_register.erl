@@ -38,7 +38,7 @@ effect({wr, Val}, Ts, _Actor, Reg) ->
 eval(rd, Reg) ->
     [Val || {TsA, {wr, Val}} <- Reg,
             not lists:any(fun({TsB,_}) ->
-                                  vclock:lt(TsA, Ts)B
+                                  vclock:lt(TsA, TsB)
                           end, Reg)
     ].
 
@@ -53,17 +53,39 @@ test() ->
     ok = po_log_node:add_peer(b,c),
 
     ok = po_log_node:update(a,{wr,a1}),
-    %% make sure update gets to everywhere before next updates
-    timer:sleep(700),
 
-    %% effectively concurrent.
-    ok = po_log_node:update(b,{wr,b1}),
+    ValTrue1 = [a1],
+    ValA1 = po_log_node:eval(a,rd),
+    ValB1 = po_log_node:eval(b,rd),
+    ValC1 = po_log_node:eval(c,rd),
+
+    ValTrue1 = ValA1 = ValB1 = ValC1,
+
+    timer:sleep(200),
+     
+    %% Partition
+    ok = po_log_node:rem_peer(a,b),
+    ok = po_log_node:rem_peer(c,b),
+
+    timer:sleep(100),
+    
+    %% Concurrent.
     ok = po_log_node:update(a,{wr,a2}),
+    ok = po_log_node:update(b,{wr,b1}),
+    [a2] = po_log_node:eval(a,rd),
+    [b1] = po_log_node:eval(b,rd),
 
-    %% Wait for stability
-    timer:sleep(1000),
+    timer:sleep(100),
+    
+    %% Heal Paritition
+    ok = po_log_node:add_peer(a,b),
+    ok = po_log_node:add_peer(c,b),
 
-    Val = [a2,b1],
-    Val = po_log_node:eval(a, rd),
-    Val = po_log_node:eval(b, rd),
-    Val = po_log_node:eval(c, rd).
+    timer:sleep(100),
+    
+    ValTrue = [a2,b1],
+    ValA = po_log_node:eval(a, rd),
+    ValB = po_log_node:eval(b, rd),
+    ValC = po_log_node:eval(c, rd),
+
+    ValTrue = ValA = ValB = ValC.
