@@ -24,20 +24,24 @@
 
 -behaviour(po_crdt).
 
--export([new/1,
-         effect/4,
+-export([new/0,
+         effect/3,
          eval/2,
+         stable/2,
          test/0
         ]).
 
-new(_Actor) ->
+new() ->
     ordsets:new().
 
-effect({add, E}, Ts, _Actor, Set) ->
+effect({add, E}, Ts, Set) ->
     ordsets:add_element({Ts, E}, Set).
 
 eval(rd, Set) ->
     [ E || {_,E} <- ordsets:to_list(Set)].
+
+stable(_Ts, Set) ->
+    Set.
 
 test() ->
     {ok,_} = po_log_node:start(a,?MODULE),

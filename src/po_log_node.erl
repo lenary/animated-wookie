@@ -85,8 +85,8 @@ init([Mod,Name]) ->
     timer:send_interval(100, retry_outgoing),
     timer:send_interval(100, retry_incoming),
     
-    DT = Mod:new(Name),
-    lager:info("[~p:~p:~s] new(self()) = ~p", [self(), Name, Mod, DT]),
+    DT = Mod:new(),
+    lager:info("[~p:~p:~s] new() = ~p", [self(), Name, Mod, DT]),
 
     {ok, #po_log_node{name=Name, mod=Mod, dt=DT, trcb=TRCB}}.
 
@@ -112,7 +112,11 @@ handle_call({update, Operation}, _From, State = #po_log_node{mod=Mod,dt=DT}) ->
     %% Local Effect
     DT1 = apply_effect(State#po_log_node.name,Mod,Operation,Ts,DT),
 
-    {reply, ok, State#po_log_node{dt=DT1,trcb=TRCB1}};
+    %% Stability
+    MaybeStable = trcb:stable(TRCB1),
+    DT2 = apply_stable(State#po_log_node.name, Mod, DT1, MaybeStable),
+
+    {reply, ok, State#po_log_node{dt=DT2,trcb=TRCB1}};
 
 handle_call(_Request, _From, State) ->
     {reply, ok, State}.
@@ -123,13 +127,20 @@ handle_cast({effect, Operation, Ts, Origin}, State=#po_log_node{mod=Mod,dt=DT,tr
     {ok, Effects, TRCB1} = trcb:deliver(Operation, Ts, Origin, TRCB),
     case Effects of
         [] -> ok;
-        [_|_] -> lager:info("[~p:~p:~s] effects delivered by ts ~p -> ~p", [self(), State#po_log_node.name, Mod, Ts, Effects])
+        [_|_] -> lager:debug("[~p:~p:~s] effects delivered by ts ~p -> ~p", [self(), State#po_log_node.name, Mod, Ts, Effects])
     end,
 
     %% Local Effects
     DT1 = apply_effects(State#po_log_node.name, Mod, Effects, DT),
-    
-    {noreply, State#po_log_node{dt=DT1,trcb=TRCB1}};
+
+    %% Stability
+    case Effects of
+        [] -> DT2 = DT1;
+        _  -> MaybeStable = trcb:stable(TRCB1),
+              DT2 = apply_stable(State#po_log_node.name, Mod, DT1, MaybeStable)
+    end,
+
+    {noreply, State#po_log_node{dt=DT2,trcb=TRCB1}};
 
 handle_cast(_Msg, State) ->
     {noreply, State}.
@@ -144,12 +155,20 @@ handle_info(retry_incoming, State= #po_log_node{mod=Mod,dt=DT,trcb=TRCB}) ->
     {ok, Effects, TRCB1} = trcb:retry_deliver(TRCB),
     case Effects of
         [] -> ok;
-        [_|_] -> lager:info("[~p:~p:~s] effects delivered -> ~p", [self(), State#po_log_node.name, Mod, Effects])
+        _  -> lager:debug("[~p:~p:~s] effects delivered -> ~p", [self(), State#po_log_node.name, Mod, Effects])
     end,
 
     %% Local Effects
     DT1 = apply_effects(State#po_log_node.name, Mod, Effects, DT),
-    {noreply, State#po_log_node{trcb=TRCB1, dt=DT1}};
+
+    %% Stability
+    case Effects of
+        [] -> DT2 = DT1;
+        _  -> MaybeStable = trcb:stable(TRCB1),
+              DT2 = apply_stable(State#po_log_node.name, Mod, DT1, MaybeStable)
+    end,
+
+    {noreply, State#po_log_node{trcb=TRCB1, dt=DT2}};
 
 handle_info(_Info, State) ->
     {noreply, State}.
@@ -171,6 +190,19 @@ apply_effects(Name, Mod, [{Operation,Ts}|Rest], DT) ->
     apply_effects(Name, Mod, Rest, DT1).
 
 apply_effect(Name, Mod, Operation, Ts, DT) ->
-    DT1 = Mod:effect(Operation, Ts, Name, DT),
-    lager:info("[~p:~p:~s] effect(~p, ~p, self(), ~p) = ~p", [self(), Name, Mod, Operation, Ts, DT, DT1]),
+    DT1 = Mod:effect(Operation, Ts, DT),
+    lager:info("[~p:~p:~s] effect(~p, ~p, ~p) = ~p", [self(), Name, Mod, Operation, Ts, DT, DT1]),
+    DT1.
+
+
+apply_stable(_Name, _Mod, DT, unstable) ->
+    DT;
+apply_stable(Name, Mod, DT, {stable, Ts}) ->
+    DT1 = Mod:stable(Ts, DT),
+
+    case DT1 =:= DT of
+        false -> lager:info("[~p:~p:~s] stable(~p, ~p) = ~p", [self(), Name, Mod, Ts, DT, DT1]);
+        _     -> ok
+    end,
+
     DT1.

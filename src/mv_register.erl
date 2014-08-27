@@ -23,16 +23,17 @@
 -module(mv_register).
 -behaviour(po_crdt).
 
--export([new/1,
-         effect/4,
+-export([new/0,
+         effect/3,
          eval/2,
+         stable/2,
          test/0
         ]).
 
-new(_Actor) ->
+new() ->
     ordsets:new().
 
-effect({wr, Val}, Ts, _Actor, Reg) ->
+effect({wr, Val}, Ts, Reg) ->
     ordsets:add_element({Ts, {wr, Val}}, Reg).
 
 eval(rd, Reg) ->
@@ -42,11 +43,14 @@ eval(rd, Reg) ->
                           end, Reg)
     ].
 
+stable(_Ts, Reg) ->
+    Reg.
+
 %% This depends on the delay of 500ms of effect message transitiions.
 test() ->
-    {ok, _} = po_log_node:start(a, ?MODULE),
-    {ok, _} = po_log_node:start(b, ?MODULE),
-    {ok, _} = po_log_node:start(c, ?MODULE),
+    {ok, A} = po_log_node:start(a, ?MODULE),
+    {ok, B} = po_log_node:start(b, ?MODULE),
+    {ok, C} = po_log_node:start(c, ?MODULE),
 
     ok = po_log_node:add_peer(a,b),
     ok = po_log_node:add_peer(a,c),
@@ -88,4 +92,8 @@ test() ->
     ValB = po_log_node:eval(b, rd),
     ValC = po_log_node:eval(c, rd),
 
-    ValTrue = ValA = ValB = ValC.
+    ValTrue = ValA = ValB = ValC,
+
+    exit(A,kill),
+    exit(B,kill),
+    exit(C,kill).

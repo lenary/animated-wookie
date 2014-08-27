@@ -35,14 +35,15 @@
 
 %% Some networks lose messages, we'll assume that they get lost this proportion
 %% of the time, but 
--define(NETWORK_LOSSINESS, 0.0).
+-define(NETWORK_LOSSINESS, 0.2).
 
 -record(trcb, {
           current     :: actor(),
-          peer_clocks :: [{actor(), timestamp()}],
-          muted = ordsets:new() :: [actor()],
-          outgoing_q = [] :: outgoing_q(),
-          incoming_q = [] :: incoming_q()
+          clock       = vclock:fresh() :: timestamp(),
+          peer_clocks = orddict:new()  :: [{actor(), timestamp()}],
+          muted       = ordsets:new()  :: [actor()],
+          outgoing_q  = []             :: outgoing_q(),
+          incoming_q  = []             :: incoming_q()
          }).
 
 -type actor() :: pid() | atom().
@@ -61,10 +62,11 @@
 
 -spec init(actor()) -> state().
 init(CurrentPeer) ->
-    PeerClocks = orddict:store(CurrentPeer, vclock:fresh(), orddict:new()),
-    #trcb{current=CurrentPeer, peer_clocks=PeerClocks}.
+    #trcb{current=CurrentPeer}.
 
 -spec add_peer(actor(), state()) -> {ok, state()}.
+add_peer(Peer, #trcb{current = Peer}) ->
+    error(badarg);
 add_peer(Peer, State = #trcb{peer_clocks=Clocks,muted=Muted}) ->
     case orddict:find(Peer, Clocks) of
         {ok, _} -> Muted1 = ordsets:del_element(Peer,Muted),
@@ -78,6 +80,8 @@ add_peer(Peer, State = #trcb{peer_clocks=Clocks,muted=Muted}) ->
 %% Re-adding the peer continues delivery of messages, no messages are lost,
 %% just delayed until the partition is healed.
 -spec rem_peer(actor(), state()) -> {ok, [{message(), timestamp()}], state()}.
+rem_peer(Peer, #trcb{current=Peer}) ->
+    error(badarg);
 rem_peer(Peer, State = #trcb{muted=Muted}) ->
     Muted1 = ordsets:add_element(Peer, Muted),
     {ok, State#trcb{muted=Muted1}}.
@@ -86,23 +90,21 @@ rem_peer(Peer, State = #trcb{muted=Muted}) ->
 %% even if it doesn't send the message.
 -spec cast(message(), state()) -> {ok, timestamp(), state()}.
 cast(Message, State=#trcb{current=Self,
-                          peer_clocks=Clocks,
+                          clock=Clock,
                           outgoing_q=Outgoing
                          }) ->
     %% 1. Increment current Peer's Clock
-    Clock = orddict:fetch(Self, Clocks),
     Clock1 = vclock:increment(Self, Clock),
-    Clocks1 = orddict:store(Self, Clock1, Clocks),
 
     %% 2. Add to outgoing queue
     Peers = peers(State),
     Outgoing1 = [{Message, Clock1, Peers} | Outgoing],
     
     %% 3. Attempt some sends
-    Outgoing2 = attempt_sends(Outgoing1, State#trcb{peer_clocks=Clocks1}),
-    lager:info("[~p:?:?] outgoing: ~p -> ~p", [self(), Outgoing1, Outgoing2]),
+    Outgoing2 = attempt_sends(Outgoing1, State#trcb{clock=Clock1}),
+    lager:debug("[~p:?:?] outgoing: ~p -> ~p", [self(), Outgoing1, Outgoing2]),
     
-    {ok, Clock1, State#trcb{peer_clocks=Clocks1,outgoing_q=Outgoing2}}.
+    {ok, Clock1, State#trcb{clock=Clock1,outgoing_q=Outgoing2}}.
 
 %% Called at interval by the server to send any outstanding messages.
 -spec retry_cast(state()) -> {ok, state()}.
@@ -124,7 +126,7 @@ deliver(Message, Clock, Origin, State=#trcb{incoming_q=Incoming}) ->
     
     %% 2. Check the Incoming Queue for ready messages
     {ok, Ready, State2} = find_ready(State1),
-    lager:info("[~p:?:?] incoming: ~p -> ~p {~p}", [self(), Incoming1, State2#trcb.incoming_q, State#trcb.peer_clocks]),
+    lager:debug("[~p:?:?] incoming: ~p -> ~p {~p}", [self(), Incoming1, State2#trcb.incoming_q, State#trcb.peer_clocks]),
 
     %% 3. Update the current peer's timestamp with delivered message timestamps
     State3 = merge_ts([Ts || {_,Ts,_} <- Ready], State2),
@@ -139,7 +141,7 @@ retry_deliver(State=#trcb{incoming_q=[]}) ->
 retry_deliver(State) ->
     %% 1. Check the Incoming Queue for ready messages
     {ok, Ready, State1} = find_ready(State),
-    lager:info("[~p:?:?] incoming: ~p -> ~p {~p}", [self(), State#trcb.incoming_q, State1#trcb.incoming_q, State#trcb.peer_clocks]),
+    lager:debug("[~p:?:?] incoming: ~p -> ~p {~p}", [self(), State#trcb.incoming_q, State1#trcb.incoming_q, State#trcb.peer_clocks]),
 
     %% 2. Update the current peer's timesamp with delivered mesage timestamps
     State2 = merge_ts([Ts || {_,Ts,_} <- Ready], State1),
@@ -148,19 +150,22 @@ retry_deliver(State) ->
     {ok, as_messages(Ready), State2}.
     
 
-%% In this version we don't actually care about stability
--spec stable(state()) -> {stable, timestamp(), state()} | unstable.
-stable(_State) ->
-    unstable.
+%% I believe that stability == glb of all recieved timestamps
+-spec stable(state()) -> {stable, timestamp()} | unstable.
+stable(#trcb{peer_clocks=PeerClocks, clock=Clock}) ->
+
+    Clocks  = [C || {_P,C} <- PeerClocks],
+    GLB = lists:foldl(fun vclock:glb/2, Clock, Clocks),
+    
+    {stable, GLB}.
 
 %% ------------------------------------------------------------------
 %% Internal Function Definitions
 %% ------------------------------------------------------------------
 
 -spec peers(state()) -> [actor()].
-peers(#trcb{current=Self,peer_clocks=Clocks}) ->
-    [Peer || Peer <- orddict:fetch_keys(Clocks),
-             Peer /= Self].
+peers(#trcb{peer_clocks=Clocks}) ->
+    orddict:fetch_keys(Clocks).
 
 -spec as_messages([incoming_entry()]) -> [{message(),timestamp()}].
 as_messages(Incoming) ->
@@ -210,22 +215,20 @@ attempt_peer_send(Origin, Message, Clock, Peer) ->
 -spec find_ready(state()) -> {ok, [incoming_entry()], state()}.
 find_ready(State=#trcb{incoming_q=[]}) ->
     {ok, [], State};
-find_ready(State=#trcb{incoming_q=Incoming, muted=Muted, peer_clocks=PeerClocks}) ->
+find_ready(State=#trcb{incoming_q=Incoming, muted=Muted, peer_clocks=PeerClocks, clock=Clock}) ->
     {NotReady, MaybeReady} = lists:partition(fun({_Message,_Ts,Origin}) ->
                                                 ordsets:is_element(Origin,Muted)
                                               end, Incoming),
 
-    CurrentTs = orddict:fetch(State#trcb.current, PeerClocks),
-
-    %% find_ready may be incorrect, but I'm not sure.
-    {Ready, NotReady1, PeerClocks1, _} = find_ready(MaybeReady, {[], NotReady, PeerClocks, CurrentTs}),
+        %% find_ready may be incorrect, but I'm not sure.
+    {Ready, NotReady1, PeerClocks1, _} = find_ready(MaybeReady, {[], NotReady, PeerClocks, Clock}),
 
     %% I really fucking hope this puts the ones with the smallest vclocks first
     %% as we apply in this order. Sigh.
     Ready1 = sort_by_ts(Ready),
     case Ready of
         [] -> ok;
-        [_|_] -> lager:info("sort_by_ts(~p) -> ~p", [Ready, Ready1])
+        [_|_] -> lager:debug("sort_by_ts(~p) -> ~p", [Ready, Ready1])
     end,
 
     {ok, Ready1, State#trcb{incoming_q=NotReady1, peer_clocks=PeerClocks1}}.
@@ -254,10 +257,5 @@ sort_by_ts(MaybeReady) ->
                end, MaybeReady).
 
 -spec merge_ts([timestamp()], state()) -> state().
-merge_ts(Tss, State=#trcb{current=Self,peer_clocks=PeerClocks}) ->
-    PeerClocks1 = orddict:update(Self,
-                                 fun(Clock) ->
-                                         vclock:merge([Clock|Tss])
-                                 end,
-                                 PeerClocks),
-    State#trcb{peer_clocks=PeerClocks1}.
+merge_ts(Tss, State=#trcb{clock=Clock}) ->
+    State#trcb{clock=vclock:merge([Clock|Tss])}.
